@@ -1,0 +1,22 @@
+# Cai dat: pip install -r requirements.txt
+# (chay tren may Windows that co PLC/camera de dung day du; cac goi
+#  fastapi/pydantic/numpy/opencv/requests/pytest chay duoc ca tren sandbox/Linux
+#  de code + chay unit test ma khong can phan cung that)
+
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+requests>=2.31.0
+pyyaml>=6.0.0
+
+# --- Fiducial Detector (fiducial_detector/) ---
+ultralytics>=8.3.0
+
+# --- PLC Gateway (gateway/) - chi hoat dong that tren Windows (pythonnet + .NET) ---
+pythonnet>=3.0.0
+
+# --- Test ---
+pytest>=7.4.0
+httpx>=0.25.0

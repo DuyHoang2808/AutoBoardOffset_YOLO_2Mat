@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+build/
+dist/
+
+# Logs
+*.log
+
+# Model
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Dataset
+dataset/
+data/
+
+# Images
+*.jpg
+*.jpeg
+*.png
+
+# Cache
+.cache/
