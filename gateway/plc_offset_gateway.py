@@ -296,6 +296,32 @@ class MoveResponse(BaseModel):
     elapsed_seconds: Optional[float] = None
 
 
+class MoveBuLechRequest(PLCFeedbackOverrides):
+    """Di chuyển camera tới toạ độ Board (Gerber/design) - tự động quy đổi sang
+    PLC qua ma trận calib tĩnh (board_to_plc) + bù lệch board (rigid offset),
+    giống hệt bước đầu của /api/inspect-defect. Dùng cho VRS thủ công để camera
+    không còn di chuyển theo toạ độ thô chưa mapping/bù lệch như /api/plc/move."""
+    board_x: float
+    board_y: float
+    board_id: Optional[str] = None
+    defect_id: Optional[int] = None
+    board_side: str = "A"  # "A" hoặc "B" - chọn calib tĩnh + offset runtime theo mặt
+    apply_board_offset: bool = True
+
+
+class MoveBuLechResponse(BaseModel):
+    success: bool
+    message: str
+    board_coords: Optional[Dict[str, float]] = None    # toạ độ Board đầu vào
+    nominal_coords: Optional[Dict[str, float]] = None  # PLC nominal (đã board_to_plc, CHƯA bù lệch)
+    plc_x: Optional[float] = None                       # PLC compensated đã gửi thực tế
+    plc_y: Optional[float] = None
+    board_side: Optional[str] = None
+    offset_applied: bool = False                        # đã bù lệch chưa
+    offset_info: Optional[Dict[str, Any]] = None
+    elapsed_seconds: Optional[float] = None
+
+
 class InspectDefectRequest(PLCFeedbackOverrides):
     """Request để soi lỗi: gửi PLC + chụp ảnh + gọi AI Detection (giống hệt gateway gốc)."""
     defect_x: float
@@ -1276,6 +1302,94 @@ async def move_camera_simple(request: MoveRequest):
         raise
     except Exception as e:
         logger.error(f"❌ Move camera failed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        plc.close()
+
+
+@app.post("/api/plc/move_bulech", response_model=MoveBuLechResponse)
+async def move_camera_bulech(request: MoveBuLechRequest):
+    """Di chuyển camera tới toạ độ Board sau khi quy đổi sang PLC (board_to_plc)
+    và bù lệch board (rigid offset) - giống hệt bước đầu của /api/inspect-defect
+    nhưng KHÔNG chụp ảnh/AI. Dùng cho nút "Di chuyển Camera" ở VRS thủ công thay
+    cho /api/plc/move (vốn gửi x/y thô, không mapping/không bù lệch)."""
+    board_side = (request.board_side or "A").upper()
+    validate_board_side(board_side)
+
+    coeffs = load_calibration_matrix(resolve_calib_path(board_side))
+    nominal_x, nominal_y = board_to_plc(request.board_x, request.board_y, coeffs)
+    logger.info(
+        f"📍 [move_bulech] Board→PLC (mặt {board_side}): Board=({request.board_x:.3f},{request.board_y:.3f})"
+        f" → PLC nominal=({nominal_x:.3f},{nominal_y:.3f})"
+    )
+
+    final_x, final_y = nominal_x, nominal_y
+    offset_applied = False
+    offset_info = None
+
+    if request.apply_board_offset:
+        offset_path = resolve_offset_path(board_side)
+        loaded = load_saved_rigid_offset(offset_path)
+        if loaded is not None:
+            R, t, raw = loaded
+            final_x, final_y = apply_rigid_offset(nominal_x, nominal_y, R, t)
+            offset_applied = True
+            offset_info = {
+                "theta_deg": raw.get("theta_deg"),
+                "tx": raw.get("tx"), "ty": raw.get("ty"),
+                "source": raw.get("source"), "board_id": raw.get("board_id"),
+                "board_side": raw.get("board_side", board_side),
+            }
+            logger.info(
+                f"📐 [move_bulech] Offset applied: Nominal=({nominal_x:.3f},{nominal_y:.3f})"
+                f" → Compensated=({final_x:.3f},{final_y:.3f})"
+                f" [θ={raw['theta_deg']:+.4f}° tx={raw['tx']:+.4f} ty={raw['ty']:+.4f}]"
+            )
+        else:
+            logger.warning(
+                f"⚠️ [move_bulech] apply_board_offset=True nhưng CHƯA có offset runtime"
+                f" cho mặt {board_side} ({offset_path}) → dùng tọa độ nominal (CHƯA bù lệch)"
+            )
+
+    plc_config = {**DEFAULT_PLC_CONN, "mem_area": "D", "x_addr": 2810, "y_addr": 2910, "trigger_addr": 3000}
+    plc = PLCService()
+    try:
+        if not await asyncio.to_thread(plc.connect, plc_config["pc_ip"], plc_config["plc_ip"], plc_config["port"]):
+            raise HTTPException(status_code=500, detail="Failed to connect to PLC")
+
+        current_x = await asyncio.to_thread(plc.read_float_words, plc_config["mem_area"], plc_config["x_addr"])
+        current_y = await asyncio.to_thread(plc.read_float_words, plc_config["mem_area"], plc_config["y_addr"])
+
+        if not await asyncio.to_thread(
+            plc.send_coordinates, plc_config["mem_area"], plc_config["x_addr"], plc_config["y_addr"],
+            plc_config["trigger_addr"], final_x, final_y,
+        ):
+            raise HTTPException(status_code=500, detail="Failed to write coordinates to PLC")
+
+        fb = FeedbackConfig.from_request(request)
+        fb.apply_dynamic_motion_timeout(current_x, current_y, final_x, final_y)
+        elapsed = await wait_for_plc_position(plc, 10000, fb)
+
+        message = f"Moved to Board=({request.board_x:.3f},{request.board_y:.3f}) -> PLC=({final_x:.3f},{final_y:.3f})"
+        if not offset_applied:
+            message += " [CẢNH BÁO: chưa bù lệch board cho mặt " + board_side + "]"
+
+        return MoveBuLechResponse(
+            success=True,
+            message=message,
+            board_coords={"x": request.board_x, "y": request.board_y},
+            nominal_coords={"x": nominal_x, "y": nominal_y},
+            plc_x=final_x,
+            plc_y=final_y,
+            board_side=board_side,
+            offset_applied=offset_applied,
+            offset_info=offset_info,
+            elapsed_seconds=elapsed,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [move_bulech] Move camera failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         plc.close()
