@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import json
 import logging
@@ -1254,6 +1255,64 @@ async def _capture_and_detect_marker(
 
 
 # ===============================
+# Khoá độc quyền PLC
+# ===============================
+# Mỗi endpoint tạo `PLCService()` riêng, nên KHÔNG có xung đột state Python -
+# nhưng tất cả đều ghi vào CÙNG các thanh ghi vật lý (D2810/D2910 + trigger
+# D3000) của MỘT con PLC. Nếu 2 request chạy song song (ví dụ Auto VRS đang
+# /api/inspect-defect trong khi VRS thủ công bấm "Di chuyển Camera", hoặc 1
+# chu kỳ calib 90s đang di chuyển qua các điểm mốc) thì chúng ghi toạ độ đan
+# xen nhau rồi mỗi bên lại `wait_for_plc_position` trên vị trí do bên kia vừa
+# đặt -> máy đi sai vị trí, ảnh chụp sai chỗ.
+#
+# Chốt ở tầng gateway (không phải chỉ ở app Flutter) vì gateway còn có client
+# khác: các script/GUI trong Auto_calib gọi trực tiếp cùng cổng.
+#
+# Cố tình TRẢ 409 thay vì xếp hàng: một lệnh calib 90s âm thầm chờ sau lệnh
+# khác rồi mới chạy sẽ làm operator bất ngờ hơn là báo "đang bận" ngay.
+_plc_lock = asyncio.Lock()
+_plc_lock_holder: Optional[str] = None
+
+
+def plc_exclusive(operation: str):
+    """Chỉ cho phép 1 lệnh điều khiển PLC chạy tại một thời điểm.
+
+    Đặt DƯỚI decorator `@app.post/get(...)` để FastAPI vẫn đọc được signature
+    gốc (functools.wraps giữ `__wrapped__` nên inspect.signature xuyên qua được).
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            global _plc_lock_holder
+            # asyncio đơn luồng: giữa lúc kiểm tra locked() và lúc acquire()
+            # thành công trên khoá đang rảnh không có điểm await nào, nên
+            # không có kẽ hở cho request khác chen vào.
+            if _plc_lock.locked():
+                busy_with = _plc_lock_holder or "lệnh khác"
+                logger.warning(
+                    f"⛔ Từ chối '{operation}': PLC đang bận với '{busy_with}'"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"PLC đang bận ({busy_with}). Đợi lệnh hiện tại xong "
+                        f"rồi thử lại."
+                    ),
+                )
+            async with _plc_lock:
+                _plc_lock_holder = operation
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    _plc_lock_holder = None
+
+        return wrapper
+
+    return decorator
+
+
+# ===============================
 # Endpoints (giữ nguyên endpoint cơ bản từ gateway gốc)
 # ===============================
 @app.get("/")
@@ -1275,6 +1334,7 @@ async def root():
 
 
 @app.post("/api/plc/move", response_model=MoveResponse)
+@plc_exclusive("di chuyển PLC (/api/plc/move)")
 async def move_camera_simple(request: MoveRequest):
     """Di chuyển PLC tới toạ độ X,Y (đơn vị mm, đã tính sẵn) - dùng để test tay hoặc tích hợp ngoài."""
     plc_config = {**DEFAULT_PLC_CONN, "mem_area": "D", "x_addr": 2810, "y_addr": 2910, "trigger_addr": 3000}
@@ -1308,6 +1368,7 @@ async def move_camera_simple(request: MoveRequest):
 
 
 @app.post("/api/plc/move_bulech", response_model=MoveBuLechResponse)
+@plc_exclusive("di chuyển PLC có bù lệch (/api/plc/move_bulech)")
 async def move_camera_bulech(request: MoveBuLechRequest):
     """Di chuyển camera tới toạ độ Board sau khi quy đổi sang PLC (board_to_plc)
     và bù lệch board (rigid offset) - giống hệt bước đầu của /api/inspect-defect
@@ -1396,6 +1457,7 @@ async def move_camera_bulech(request: MoveBuLechRequest):
 
 
 @app.post("/api/inspect-defect", response_model=InspectDefectResponse)
+@plc_exclusive("soi lỗi (/api/inspect-defect)")
 async def inspect_defect(request: InspectDefectRequest):
     """Soi lỗi: gửi toạ độ tới PLC, chờ di chuyển xong, chụp ảnh, gọi AI Detection (giống hệt gateway gốc)."""
     timing: Dict[str, float] = {}
@@ -1534,6 +1596,7 @@ async def inspect_defect(request: InspectDefectRequest):
 
 
 @app.get("/api/test-plc")
+@plc_exclusive("test kết nối PLC (/api/test-plc)")
 async def test_plc():
     plc = PLCService()
     try:
@@ -1547,6 +1610,7 @@ async def test_plc():
 
 
 @app.get("/api/test-plc-feedback")
+@plc_exclusive("đọc thanh ghi feedback PLC (/api/test-plc-feedback)")
 async def test_plc_feedback():
     """Đọc thử các thanh ghi PLC feedback (done/busy) đang cấu hình - dùng để debug."""
     plc = PLCService()
@@ -1631,6 +1695,7 @@ async def update_camera_config(config: GatewayConfigModel):
 # MỚI: /api/calib/auto-board-offset
 # ===============================
 @app.post("/api/calib/auto-board-offset", response_model=AutoBoardOffsetResponse)
+@plc_exclusive("calib bù lệch board (/api/calib/auto-board-offset)")
 async def auto_board_offset(request: AutoBoardOffsetRequest):
     """
     Thay thế bu_lech_board.py THỦ CÔNG:
@@ -1834,6 +1899,7 @@ async def anchor_info(anchor_name: str = "A", board_side: str = "A"):
 # MỚI: /api/calib/camera-axis (hiệu chỉnh ma trận T - làm 1 lần lúc setup)
 # ===============================
 @app.post("/api/calib/camera-axis", response_model=CameraAxisCalibResponse)
+@plc_exclusive("calib trục camera (/api/calib/camera-axis)")
 async def calibrate_camera_axis(request: CameraAxisCalibRequest):
     """
     Hiệu chỉnh ma trận trục camera<->máy T:
