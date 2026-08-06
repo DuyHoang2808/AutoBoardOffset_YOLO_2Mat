@@ -37,7 +37,7 @@ print(Text)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tự động đo & tính bù lệch board bằng YOLO")
     parser.add_argument("--base-url", default=CONFIG["base_url"])
-    parser.add_argument("--board-side", default="B", choices=("A", "B", "a", "b"),
+    parser.add_argument("--board-side", default="A", choices=("A", "B", "a", "b"),
                          help="Mặt board: A (mặc định) hoặc B")
     parser.add_argument("--anchor-mode", type=int, default=2, choices=(2, 3),
                          help="2 điểm (A,C, mặc định) hoặc 3 điểm (A,C,D)")
