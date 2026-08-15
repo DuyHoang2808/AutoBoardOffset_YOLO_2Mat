@@ -12,6 +12,12 @@ Cách chạy:
   python run_auto_board_offset.py --board-id BOARD-001
   python run_auto_board_offset.py --board-id BOARD-001 --board-side B
   python run_auto_board_offset.py --board-id BOARD-001 --board-side B --anchor-mode 3
+  python run_auto_board_offset.py --board-id BOARD-001 --product-code 23691025-250616-0004-nvq-aoi
+
+--product-code (tuỳ chọn): nếu truyền vào, tool sẽ gọi /api/products/select trên gateway
+TRƯỚC khi đo, để gateway + Fiducial Detector Service chuyển đúng weights YOLO + file mapping
+toạ độ của mã hàng này (xem products_registry.yaml cạnh gateway/plc_offset_gateway.py).
+Bỏ qua cờ này nếu chỉ chạy 1 mã hàng duy nhất (hành vi cũ, không đổi).
 """
 
 from __future__ import annotations
@@ -42,12 +48,30 @@ def main() -> None:
     parser.add_argument("--anchor-mode", type=int, default=2, choices=(2, 3),
                          help="2 điểm (A,C, mặc định) hoặc 3 điểm (A,C,D)")
     parser.add_argument("--board-id", default=None)
+    parser.add_argument("--product-code", default=None,
+                         help="Mã hàng board (vd 23691025-250616-0004-nvq-aoi) - nếu có sẽ "
+                              "gọi /api/products/select trước khi đo")
     parser.add_argument("--plc-pc-ip", default=CONFIG["plc_pc_ip"])
     parser.add_argument("--plc-ip", default=CONFIG["plc_ip"])
     parser.add_argument("--plc-port", type=int, default=CONFIG["plc_port"])
     args = parser.parse_args()
 
     board_side = args.board_side.upper()
+
+    if args.product_code:
+        print(f"--> Chọn mã hàng: {args.product_code} ...")
+        try:
+            sel_resp = requests.post(
+                f"{args.base_url}/api/products/select", json={"product_code": args.product_code}, timeout=30,
+            )
+            sel_data = sel_resp.json()
+        except requests.RequestException as e:
+            print(f"❌ Không gọi được gateway để chọn mã hàng: {e}")
+            sys.exit(1)
+        if not sel_data.get("success"):
+            print(f"❌ Chọn mã hàng thất bại: {sel_data.get('message')}")
+            sys.exit(1)
+        print(f"✅ Đã chọn mã hàng {args.product_code} (weights={sel_data.get('weights_path')})")
 
     payload = {
         "anchor_mode": args.anchor_mode,

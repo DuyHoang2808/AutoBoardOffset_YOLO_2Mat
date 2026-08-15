@@ -53,6 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import requests
+import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -86,7 +87,7 @@ PLC_MOTION_TIMEOUT_SAFETY_FACTOR = 1.5
 PLC_MOTION_TIMEOUT_OVERHEAD_MS = 1000
 PLC_MOTION_MIN_COMPLETION_RATIO = 0.8
 PLC_MOTION_MIN_COMPLETION_FLOOR_MS = 300
-CAMERA_SNAPSHOT_FRESH_FETCHES = 2
+CAMERA_SNAPSHOT_FRESH_FETCHES = 1
 CAMERA_SNAPSHOT_FRESH_DELAY_MS = 120
 PLC_ALREADY_IN_POSITION_TOLERANCE_MM = 0.5
 
@@ -232,6 +233,107 @@ GATEWAY_CONFIG: Dict[str, Any] = load_gateway_config()
 
 
 # ===============================
+# MỚI: Danh mục mã hàng (products_registry.yaml) - hỗ trợ NHIỀU MÃ HÀNG, chọn tự động
+# ===============================
+# Mỗi mã hàng board (vd "23691025-250616-0004-nvq-aoi") cần 1 bộ weights YOLO riêng (marker
+# khác nhau) + 1 bộ file mapping toạ độ riêng (anchor points/offset, CÙNG cấu trúc calib
+# tĩnh/offset runtime đã có, chỉ khác chỗ lưu). Kỹ thuật viên tự train weights + tự chạy
+# hiệu chỉnh (calib) cho từng mã hàng, chỉ cần thêm 1 mục vào file này (calib_dir trỏ tới
+# thư mục riêng của mã hàng đó) - KHÔNG cần sửa code.
+PRODUCTS_REGISTRY_FILE = RUNTIME_DIR / "products_registry.yaml"
+ACTIVE_PRODUCT_STATE_FILE = RUNTIME_DIR / "active_product_state.json"
+
+# Mã hàng mặc định = mã đang chạy production hiện tại. calib_dir = chính thư mục gateway/
+# (RUNTIME_DIR) để KHÔNG phải di chuyển vrs_calib_side_a/b.json + offset_runtime_side_a/b.json
+# đang dùng thật - tương thích ngược 100%, không cần migrate gì khi mới bật tính năng này.
+DEFAULT_PRODUCTS_REGISTRY: Dict[str, Any] = {
+    "default_product": "23691025-250616-0004-nvq-aoi",
+    "products": {
+        "23691025-250616-0004-nvq-aoi": {
+            "weights_path": r"D:\Camera\Weight\VRS_yolo11n_640x640\weights\best.pt",
+            "class_name_filter": 0,
+            "imgsz": 640,
+            "calib_dir": str(RUNTIME_DIR),
+        },
+    },
+}
+
+
+def save_products_registry(registry: Dict[str, Any]) -> None:
+    PRODUCTS_REGISTRY_FILE.write_text(
+        yaml.safe_dump(registry, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def load_products_registry() -> Dict[str, Any]:
+    """Đọc danh mục mã hàng, tự tạo file với mã hàng production hiện tại nếu chưa có."""
+    if not PRODUCTS_REGISTRY_FILE.exists():
+        save_products_registry(DEFAULT_PRODUCTS_REGISTRY)
+        return DEFAULT_PRODUCTS_REGISTRY.copy()
+    try:
+        loaded = yaml.safe_load(PRODUCTS_REGISTRY_FILE.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict) or "products" not in loaded:
+            raise ValueError("products_registry.yaml phải có key 'products'")
+        return loaded
+    except Exception as e:
+        logger.warning(f"⚠️  Không đọc được {PRODUCTS_REGISTRY_FILE}, dùng mặc định: {e}")
+        save_products_registry(DEFAULT_PRODUCTS_REGISTRY)
+        return DEFAULT_PRODUCTS_REGISTRY.copy()
+
+
+PRODUCTS_REGISTRY: Dict[str, Any] = load_products_registry()
+ACTIVE_PRODUCT_CODE: Optional[str] = None
+
+
+def get_active_product() -> Optional[Dict[str, Any]]:
+    """Config (dict) của mã hàng đang active, hoặc None nếu chưa từng chọn mã hàng nào
+    (hệ thống chạy theo kiểu CŨ - dùng calib_paths/vrs_calib_json_path chung như trước)."""
+    if not ACTIVE_PRODUCT_CODE:
+        return None
+    return PRODUCTS_REGISTRY.get("products", {}).get(ACTIVE_PRODUCT_CODE)
+
+
+def resolve_fiducial_service_base_url() -> str:
+    """Suy ra base URL của Fiducial Detector Service từ fiducial_api_url đã cấu hình (vd
+    http://127.0.0.1:8191/api/detect-marker -> http://127.0.0.1:8191) thay vì thêm 1 field
+    config mới dễ bị lệch giá trị với fiducial_api_url."""
+    url = GATEWAY_CONFIG["fiducial_api_url"]
+    suffix = "/api/detect-marker"
+    if url.endswith(suffix):
+        return url[: -len(suffix)]
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _save_active_product_state() -> None:
+    ACTIVE_PRODUCT_STATE_FILE.write_text(
+        json.dumps({"product_code": ACTIVE_PRODUCT_CODE}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_startup_active_product() -> None:
+    """Lúc khởi động: khôi phục mã hàng đã chọn gần nhất (qua lần restart gateway), nếu
+    chưa từng chọn thì dùng default_product trong registry."""
+    global ACTIVE_PRODUCT_CODE
+    code = None
+    if ACTIVE_PRODUCT_STATE_FILE.exists():
+        try:
+            code = json.loads(ACTIVE_PRODUCT_STATE_FILE.read_text(encoding="utf-8")).get("product_code")
+        except Exception as e:
+            logger.warning(f"⚠️  Không đọc được {ACTIVE_PRODUCT_STATE_FILE}: {e}")
+    if not code or code not in PRODUCTS_REGISTRY.get("products", {}):
+        code = PRODUCTS_REGISTRY.get("default_product")
+    if code and code in PRODUCTS_REGISTRY.get("products", {}):
+        ACTIVE_PRODUCT_CODE = code
+
+
+_load_startup_active_product()
+
+
+# ===============================
 # PLC DLL loading (pythonnet) - ClassLibrary.dll đã copy vào cùng thư mục
 # ===============================
 PLC_AVAILABLE = False
@@ -293,6 +395,32 @@ class MoveResponse(BaseModel):
     message: str
     plc_x: Optional[float] = None
     plc_y: Optional[float] = None
+    elapsed_seconds: Optional[float] = None
+
+
+class MoveBuLechRequest(PLCFeedbackOverrides):
+    """Di chuyển camera tới toạ độ Board (Gerber/design) - tự động quy đổi sang
+    PLC qua ma trận calib tĩnh (board_to_plc) + bù lệch board (rigid offset),
+    giống hệt bước đầu của /api/inspect-defect. Dùng cho VRS thủ công để camera
+    không còn di chuyển theo toạ độ thô chưa mapping/bù lệch như /api/plc/move."""
+    board_x: float
+    board_y: float
+    board_id: Optional[str] = None
+    defect_id: Optional[int] = None
+    board_side: str = "A"  # "A" hoặc "B" - chọn calib tĩnh + offset runtime theo mặt
+    apply_board_offset: bool = True
+
+
+class MoveBuLechResponse(BaseModel):
+    success: bool
+    message: str
+    board_coords: Optional[Dict[str, float]] = None    # toạ độ Board đầu vào
+    nominal_coords: Optional[Dict[str, float]] = None  # PLC nominal (đã board_to_plc, CHƯA bù lệch)
+    plc_x: Optional[float] = None                       # PLC compensated đã gửi thực tế
+    plc_y: Optional[float] = None
+    board_side: Optional[str] = None
+    offset_applied: bool = False                        # đã bù lệch chưa
+    offset_info: Optional[Dict[str, Any]] = None
     elapsed_seconds: Optional[float] = None
 
 
@@ -438,6 +566,20 @@ class BoardToPlcPreviewResponse(BaseModel):
     plc_compensated_xy: List[float]
     offset_loaded: bool
     offset_source: Optional[str] = None
+
+
+# --- MỚI: models cho chọn mã hàng (nhiều model YOLO / nhiều bộ calib) ---
+class ProductSelectRequest(BaseModel):
+    product_code: str
+
+
+class ProductSelectResponse(BaseModel):
+    success: bool
+    product_code: str
+    message: str
+    weights_path: Optional[str] = None
+    calib_dir: Optional[str] = None
+    fiducial_class_names: Optional[Dict[str, Any]] = None
 
 
 # ===============================
@@ -999,6 +1141,30 @@ class FiducialClient:
             logger.error(f"❌ Fiducial Detector call failed: {e}")
             return None
 
+    @staticmethod
+    def select_model(
+        base_url: str,
+        weights_path: str,
+        class_name_filter: Optional[Any],
+        imgsz: int,
+        timeout_s: float = 30.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Báo Fiducial Detector Service đổi sang dùng weights của mã hàng vừa chọn
+        (POST {base_url}/api/select-model). Trả None nếu lỗi mạng/service không phản hồi."""
+        try:
+            response = requests.post(
+                f"{base_url}/api/select-model",
+                json={"weights_path": weights_path, "class_name_filter": class_name_filter, "imgsz": imgsz},
+                timeout=timeout_s,
+            )
+            result = response.json()
+            if response.status_code != 200:
+                logger.error(f"❌ Fiducial select-model trả lỗi HTTP {response.status_code}: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"❌ Gọi Fiducial select-model thất bại: {e}")
+            return None
+
 
 # ===============================
 # MỚI: quy đổi lệch pixel -> lệch mm THEO TRỤC PLC
@@ -1124,10 +1290,17 @@ def _get_anchor_names(anchor_mode: int) -> List[str]:
 def resolve_calib_path(board_side: str) -> str:
     """Trả đường dẫn file calib tĩnh cho mặt board đã cho.
 
-    Ưu tiên: calib_paths[side] → (nếu side=="A") fallback vrs_calib_json_path cũ.
-    Nếu thiếu mặt B → HTTPException 400 rõ ràng.
+    MỚI: nếu có mã hàng đang active (products_registry.yaml) → dùng calib_dir của mã hàng
+    đó (mỗi mã hàng 1 bộ file riêng, không đụng nhau khi đổi mã hàng).
+    Nếu chưa từng chọn mã hàng nào (hệ thống CŨ, 1 mã hàng duy nhất) → giữ nguyên logic cũ:
+    calib_paths[side] → (nếu side=="A") fallback vrs_calib_json_path.
     """
     side = (board_side or "A").upper()
+
+    product = get_active_product()
+    if product is not None:
+        return str(Path(product["calib_dir"]) / f"vrs_calib_side_{side.lower()}.json")
+
     calib_map: Dict[str, str] = GATEWAY_CONFIG.get("calib_paths") or {}
     if side in calib_map and calib_map[side]:
         return calib_map[side]
@@ -1146,10 +1319,16 @@ def resolve_calib_path(board_side: str) -> str:
 def resolve_offset_path(board_side: str) -> str:
     """Trả đường dẫn file offset runtime cho mặt board đã cho.
 
-    Ưu tiên: offset_paths[side] → (nếu side=="A") fallback offset_runtime_json_path cũ.
-    Nếu thiếu → tạo tên mặc định trong RUNTIME_DIR.
+    MỚI: nếu có mã hàng đang active → dùng calib_dir của mã hàng đó (xem resolve_calib_path).
+    Nếu chưa từng chọn mã hàng nào → giữ nguyên logic cũ: offset_paths[side] → (side=="A")
+    fallback offset_runtime_json_path → tên mặc định trong RUNTIME_DIR.
     """
     side = (board_side or "A").upper()
+
+    product = get_active_product()
+    if product is not None:
+        return str(Path(product["calib_dir"]) / f"offset_runtime_side_{side.lower()}.json")
+
     offset_map: Dict[str, str] = GATEWAY_CONFIG.get("offset_paths") or {}
     if side in offset_map and offset_map[side]:
         return offset_map[side]
@@ -1245,7 +1424,85 @@ async def root():
         "calib_paths": GATEWAY_CONFIG.get("calib_paths") or {},
         "offset_paths": GATEWAY_CONFIG.get("offset_paths") or {},
         "config_file": str(CONFIG_FILE),
+        "active_product": ACTIVE_PRODUCT_CODE,
+        "products_registry_file": str(PRODUCTS_REGISTRY_FILE),
     }
+
+
+@app.get("/api/products")
+async def list_products():
+    """Danh sách mã hàng có trong products_registry.yaml - app Flutter dùng để hiện dropdown."""
+    products = PRODUCTS_REGISTRY.get("products", {})
+    return {
+        "products": list(products.keys()),
+        "default_product": PRODUCTS_REGISTRY.get("default_product"),
+        "active_product": ACTIVE_PRODUCT_CODE,
+        "registry_file": str(PRODUCTS_REGISTRY_FILE),
+    }
+
+
+@app.get("/api/products/active")
+async def get_active_product_info():
+    """Mã hàng đang active hiện tại + đường dẫn calib đã resolve - dùng để app Flutter xác
+    nhận lại sau khi chọn, hoặc hiện thị lúc khởi động app."""
+    product = get_active_product()
+    return {
+        "active_product": ACTIVE_PRODUCT_CODE,
+        "config": product,
+        "calib_path_side_a": resolve_calib_path("A") if product else None,
+        "calib_path_side_b": resolve_calib_path("B") if product else None,
+    }
+
+
+@app.post("/api/products/select", response_model=ProductSelectResponse)
+async def select_product(request: ProductSelectRequest):
+    """Đổi mã hàng đang active - gọi từ app Flutter khi operator chọn mã hàng.
+
+    Sẽ: (1) tra cứu weights/calib_dir của mã hàng trong products_registry.yaml, (2) báo
+    Fiducial Detector Service đổi sang weights của mã hàng đó, (3) từ đó resolve_calib_path/
+    resolve_offset_path tự động trả về đúng file mapping toạ độ của mã hàng này cho các
+    endpoint bù lệch (/api/calib/auto-board-offset, /api/plc/move_bulech, ...).
+
+    AN TOÀN: nếu Fiducial Detector từ chối (thiếu file weights, service down...), mã hàng
+    đang active HIỆN TẠI vẫn giữ nguyên - không đổi dây chuyền đang chạy tốt sang trạng thái
+    lỗi chỉ vì chọn nhầm 1 mã hàng có cấu hình sai.
+    """
+    global ACTIVE_PRODUCT_CODE
+
+    product = PRODUCTS_REGISTRY.get("products", {}).get(request.product_code)
+    if product is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Mã hàng '{request.product_code}' chưa có trong {PRODUCTS_REGISTRY_FILE}. "
+                f"Các mã hàng hiện có: {list(PRODUCTS_REGISTRY.get('products', {}).keys())}"
+            ),
+        )
+
+    fiducial_base = resolve_fiducial_service_base_url()
+    fiducial_result = await asyncio.to_thread(
+        FiducialClient.select_model,
+        fiducial_base,
+        product["weights_path"],
+        product.get("class_name_filter"),
+        product.get("imgsz", 640),
+    )
+    if fiducial_result is None or not fiducial_result.get("success"):
+        message = (fiducial_result or {}).get("message") or f"Không gọi được Fiducial Detector Service tại {fiducial_base}"
+        logger.error(f"❌ Chọn mã hàng '{request.product_code}' thất bại (giữ nguyên mã hàng cũ '{ACTIVE_PRODUCT_CODE}'): {message}")
+        return ProductSelectResponse(success=False, product_code=request.product_code, message=message)
+
+    ACTIVE_PRODUCT_CODE = request.product_code
+    _save_active_product_state()
+    calib_dir = Path(product["calib_dir"])
+    calib_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"✅ Đã chọn mã hàng: {request.product_code} (weights={product['weights_path']}, calib_dir={calib_dir})")
+    return ProductSelectResponse(
+        success=True, product_code=request.product_code, message="OK",
+        weights_path=product["weights_path"], calib_dir=str(calib_dir),
+        fiducial_class_names=fiducial_result.get("class_names"),
+    )
 
 
 @app.post("/api/plc/move", response_model=MoveResponse)
@@ -1276,6 +1533,94 @@ async def move_camera_simple(request: MoveRequest):
         raise
     except Exception as e:
         logger.error(f"❌ Move camera failed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        plc.close()
+
+
+@app.post("/api/plc/move_bulech", response_model=MoveBuLechResponse)
+async def move_camera_bulech(request: MoveBuLechRequest):
+    """Di chuyển camera tới toạ độ Board sau khi quy đổi sang PLC (board_to_plc)
+    và bù lệch board (rigid offset) - giống hệt bước đầu của /api/inspect-defect
+    nhưng KHÔNG chụp ảnh/AI. Dùng cho nút "Di chuyển Camera" ở VRS thủ công thay
+    cho /api/plc/move (vốn gửi x/y thô, không mapping/không bù lệch)."""
+    board_side = (request.board_side or "A").upper()
+    validate_board_side(board_side)
+
+    coeffs = load_calibration_matrix(resolve_calib_path(board_side))
+    nominal_x, nominal_y = board_to_plc(request.board_x, request.board_y, coeffs)
+    logger.info(
+        f"📍 [move_bulech] Board→PLC (mặt {board_side}): Board=({request.board_x:.3f},{request.board_y:.3f})"
+        f" → PLC nominal=({nominal_x:.3f},{nominal_y:.3f})"
+    )
+
+    final_x, final_y = nominal_x, nominal_y
+    offset_applied = False
+    offset_info = None
+
+    if request.apply_board_offset:
+        offset_path = resolve_offset_path(board_side)
+        loaded = load_saved_rigid_offset(offset_path)
+        if loaded is not None:
+            R, t, raw = loaded
+            final_x, final_y = apply_rigid_offset(nominal_x, nominal_y, R, t)
+            offset_applied = True
+            offset_info = {
+                "theta_deg": raw.get("theta_deg"),
+                "tx": raw.get("tx"), "ty": raw.get("ty"),
+                "source": raw.get("source"), "board_id": raw.get("board_id"),
+                "board_side": raw.get("board_side", board_side),
+            }
+            logger.info(
+                f"📐 [move_bulech] Offset applied: Nominal=({nominal_x:.3f},{nominal_y:.3f})"
+                f" → Compensated=({final_x:.3f},{final_y:.3f})"
+                f" [θ={raw['theta_deg']:+.4f}° tx={raw['tx']:+.4f} ty={raw['ty']:+.4f}]"
+            )
+        else:
+            logger.warning(
+                f"⚠️ [move_bulech] apply_board_offset=True nhưng CHƯA có offset runtime"
+                f" cho mặt {board_side} ({offset_path}) → dùng tọa độ nominal (CHƯA bù lệch)"
+            )
+
+    plc_config = {**DEFAULT_PLC_CONN, "mem_area": "D", "x_addr": 2810, "y_addr": 2910, "trigger_addr": 3000}
+    plc = PLCService()
+    try:
+        if not await asyncio.to_thread(plc.connect, plc_config["pc_ip"], plc_config["plc_ip"], plc_config["port"]):
+            raise HTTPException(status_code=500, detail="Failed to connect to PLC")
+
+        current_x = await asyncio.to_thread(plc.read_float_words, plc_config["mem_area"], plc_config["x_addr"])
+        current_y = await asyncio.to_thread(plc.read_float_words, plc_config["mem_area"], plc_config["y_addr"])
+
+        if not await asyncio.to_thread(
+            plc.send_coordinates, plc_config["mem_area"], plc_config["x_addr"], plc_config["y_addr"],
+            plc_config["trigger_addr"], final_x, final_y,
+        ):
+            raise HTTPException(status_code=500, detail="Failed to write coordinates to PLC")
+
+        fb = FeedbackConfig.from_request(request)
+        fb.apply_dynamic_motion_timeout(current_x, current_y, final_x, final_y)
+        elapsed = await wait_for_plc_position(plc, 10000, fb)
+
+        message = f"Moved to Board=({request.board_x:.3f},{request.board_y:.3f}) -> PLC=({final_x:.3f},{final_y:.3f})"
+        if not offset_applied:
+            message += " [CẢNH BÁO: chưa bù lệch board cho mặt " + board_side + "]"
+
+        return MoveBuLechResponse(
+            success=True,
+            message=message,
+            board_coords={"x": request.board_x, "y": request.board_y},
+            nominal_coords={"x": nominal_x, "y": nominal_y},
+            plc_x=final_x,
+            plc_y=final_y,
+            board_side=board_side,
+            offset_applied=offset_applied,
+            offset_info=offset_info,
+            elapsed_seconds=elapsed,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ [move_bulech] Move camera failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         plc.close()

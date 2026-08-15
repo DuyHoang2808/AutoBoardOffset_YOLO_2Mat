@@ -32,8 +32,12 @@ mac dinh neu chua co):
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,10 +54,15 @@ logger = logging.getLogger("FiducialDetector")
 
 RUNTIME_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = RUNTIME_DIR / "fiducial_service_config.yaml"
+ACTIVE_MODEL_STATE_FILE = RUNTIME_DIR / "active_model_state.json"
 
 
 class FiducialServiceConfigModel(BaseModel):
-    """Persistent service config. Field defaults are the single source of truth."""
+    """Persistent service config (cai dat CHUNG cua service, khong phai theo tung ma hang).
+
+    weights_path/class_name_filter/imgsz o day chi la GIA TRI KHOI DONG MAC DINH dung khi
+    chua co ma hang nao duoc chon qua POST /api/select-model - xem active_model_state.json,
+    file nay moi la nguon "dang active hien tai" va se duoc uu tien truoc."""
 
     weights_path: str = Field(default_factory=lambda: str(RUNTIME_DIR / "weights" / "fiducial_best.pt"))
     class_name_filter: Optional[str] = None
@@ -99,9 +108,6 @@ def load_config() -> Dict[str, Any]:
 
 CONFIG: Dict[str, Any] = load_config()
 
-WEIGHTS_PATH = CONFIG["weights_path"]
-TARGET_CLASS_NAME = CONFIG["class_name_filter"]
-IMGSZ = CONFIG["imgsz"]
 SERVICE_PORT = CONFIG["port"]
 SAVE_IMAGES = CONFIG["save_images"]
 SAVED_IMAGES_DIR = Path(CONFIG["saved_images_dir"])
@@ -111,28 +117,114 @@ ROI_MARGIN_RATIO = 0.35
 
 
 # ===============================
-# Model loading (mock mode neu chua co file .pt)
+# Model loading + cache (ho tro NHIEU MA HANG - xem POST /api/select-model)
 # ===============================
+# Moi ma hang board co the can 1 file weights YOLO rieng (marker/nen PCB khac nhau).
+# Thay vi nap 1 model duy nhat luc khoi dong nhu truoc, o day GIU CACHE cac model da nap
+# (key = duong dan weights da resolve) de doi qua lai giua vai ma hang khong phai nap lai
+# tu dau moi lan (nap YOLO mat vai giay). Gateway la noi biet "ma hang nao -> weights nao"
+# (xem products_registry.yaml ben gateway/) va goi POST /api/select-model xuong day.
+YOLO_IMPORT_ERROR: Optional[str] = None
+try:
+    from ultralytics import YOLO  # type: ignore
+except ImportError as e:
+    YOLO = None  # type: ignore
+    YOLO_IMPORT_ERROR = str(e)
+
+_model_lock = threading.Lock()
+_model_cache: "OrderedDict[str, Tuple[Any, Dict[int, str]]]" = OrderedDict()
+_MODEL_CACHE_MAX = 6  # du cho vai chuc ma hang dung luan phien, khong lo phinh RAM/VRAM
+
 YOLO_AVAILABLE = False
 _yolo_model = None
 _model_class_names: Dict[int, str] = {}
+ACTIVE_WEIGHTS_PATH: Optional[str] = None
+ACTIVE_CLASS_FILTER: Optional[str] = CONFIG["class_name_filter"]
+ACTIVE_IMGSZ: int = CONFIG["imgsz"]
 
-try:
-    from ultralytics import YOLO  # type: ignore
 
-    if Path(WEIGHTS_PATH).is_file():
-        _yolo_model = YOLO(WEIGHTS_PATH)
-        _model_class_names = _yolo_model.names if isinstance(_yolo_model.names, dict) else dict(enumerate(_yolo_model.names))
+def _load_model_cached(weights_path: str) -> Tuple[Any, Dict[int, str]]:
+    """Nap YOLO tu weights_path (dung lai neu da nap truoc do). Raise neu thieu file/loi."""
+    if YOLO is None:
+        raise RuntimeError(f"Chua cai ultralytics (pip install ultralytics): {YOLO_IMPORT_ERROR}")
+
+    key = str(Path(weights_path).resolve())
+    if key in _model_cache:
+        _model_cache.move_to_end(key)
+        return _model_cache[key]
+
+    if not Path(key).is_file():
+        raise FileNotFoundError(f"Khong tim thay file model tai: {key}")
+
+    model = YOLO(key)
+    names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+    _model_cache[key] = (model, names)
+    if len(_model_cache) > _MODEL_CACHE_MAX:
+        _model_cache.popitem(last=False)
+    return _model_cache[key]
+
+
+def _activate_model(weights_path: str, class_name_filter: Optional[str], imgsz: int) -> None:
+    """Nap (hoac lay tu cache) va dat lam model dang hoat dong.
+
+    Raise neu loi - KHONG doi model dang active hien tai trong truong hop do (an toan hon:
+    tranh dang chay ngon lanh voi 1 ma hang roi bi rot ve mock mode chi vi chon nham ma
+    hang khac co weights_path sai)."""
+    global YOLO_AVAILABLE, _yolo_model, _model_class_names
+    global ACTIVE_WEIGHTS_PATH, ACTIVE_CLASS_FILTER, ACTIVE_IMGSZ
+
+    model, names = _load_model_cached(weights_path)
+    with _model_lock:
+        _yolo_model = model
+        _model_class_names = names
         YOLO_AVAILABLE = True
-        logger.info(f"Da nap YOLO model: {WEIGHTS_PATH} (classes={_model_class_names})")
-    else:
-        logger.warning(f"Chua tim thay file model tai: {WEIGHTS_PATH}")
+        ACTIVE_WEIGHTS_PATH = str(Path(weights_path).resolve())
+        ACTIVE_CLASS_FILTER = class_name_filter
+        ACTIVE_IMGSZ = imgsz
+
+
+def _save_active_model_state() -> None:
+    """Luu lai model dang active de nho qua lan restart service (vd service crash giua ca
+    lam viec van tu dong nap lai dung ma hang dang chay, khong roi ve mac dinh sai)."""
+    ACTIVE_MODEL_STATE_FILE.write_text(
+        json.dumps(
+            {
+                "weights_path": ACTIVE_WEIGHTS_PATH,
+                "class_name_filter": ACTIVE_CLASS_FILTER,
+                "imgsz": ACTIVE_IMGSZ,
+            },
+            indent=2, ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_startup_active_model() -> None:
+    """Luc khoi dong: uu tien model da chon gan nhat (active_model_state.json, ton tai
+    qua lan restart). Neu chua co (lan dau chay / chua tung goi /api/select-model) thi
+    dung weights_path mac dinh trong fiducial_service_config.yaml (tuong thich nguoc voi
+    hanh vi cu, luc chua co khai niem nhieu ma hang)."""
+    if ACTIVE_MODEL_STATE_FILE.exists():
+        try:
+            state = json.loads(ACTIVE_MODEL_STATE_FILE.read_text(encoding="utf-8"))
+            _activate_model(
+                state["weights_path"], state.get("class_name_filter"), state.get("imgsz", CONFIG["imgsz"]),
+            )
+            logger.info(f"Da khoi phuc model dang active gan nhat: {ACTIVE_WEIGHTS_PATH} (classes={_model_class_names})")
+            return
+        except Exception as e:
+            logger.warning(f"Khong doc duoc {ACTIVE_MODEL_STATE_FILE}, dung weights_path mac dinh trong config: {e}")
+
+    try:
+        _activate_model(CONFIG["weights_path"], CONFIG["class_name_filter"], CONFIG["imgsz"])
+        logger.info(f"Da nap YOLO model mac dinh: {ACTIVE_WEIGHTS_PATH} (classes={_model_class_names})")
+    except Exception as e:
+        logger.warning(f"Chua san sang model nao ({e}).")
         logger.warning("Service chay MOCK MODE - /api/detect-marker se tra found=false.")
-        logger.warning(f"Dat file .pt vao dung duong dan tren (hoac sua weights_path trong {CONFIG_FILE}) roi khoi dong lai.")
-except ImportError:
-    logger.warning("Chua cai ultralytics (pip install ultralytics). Service chay MOCK MODE.")
-except Exception as e:
-    logger.error(f"Loi nap YOLO model: {e}. Service chay MOCK MODE.")
+        logger.warning(f"Dat file .pt dung duong dan trong {CONFIG_FILE}, hoac goi POST /api/select-model, roi thu lai.")
+
+
+_load_startup_active_model()
 
 
 # ===============================
@@ -154,6 +246,27 @@ class DetectMarkerResponse(BaseModel):
     message: Optional[str] = None
 
 
+class SelectModelRequest(BaseModel):
+    """Goi tu Gateway (plc_offset_gateway.py) khi operator chon ma hang tren app - gateway
+    tra cuu weights_path/class_name_filter/imgsz cua ma hang do trong products_registry.yaml
+    roi forward xuong day. Service nay KHONG can biet khai niem "ma hang" la gi.
+
+    class_name_filter: kieu Any (khong ep str) vi products_registry.yaml co the chua gia
+    tri 0 (int) voi y nghia "khong loc" - giong het quy uoc cu cua fiducial_service_config.yaml
+    (falsy -> _select_class_indices tra None, dung moi class)."""
+
+    weights_path: str
+    class_name_filter: Optional[Any] = None
+    imgsz: int = 640
+
+
+class SelectModelResponse(BaseModel):
+    success: bool
+    weights_path: Optional[str] = None
+    class_names: Optional[Dict[int, str]] = None
+    message: str
+
+
 # ===============================
 # Suy luan YOLO + chon candidate tot nhat
 # ===============================
@@ -169,9 +282,9 @@ def _select_class_indices(class_names: Dict[int, str], target_substring: Optiona
 def _run_yolo(image_bgr: np.ndarray, confidence_threshold: float) -> List[Dict[str, Any]]:
     """Chay YOLO, tra list candidate: [{bbox:[x1,y1,x2,y2], confidence:float, class_id:int}, ...]"""
     results = _yolo_model.predict(
-        source=image_bgr, imgsz=IMGSZ, conf=confidence_threshold, verbose=False,
+        source=image_bgr, imgsz=ACTIVE_IMGSZ, conf=confidence_threshold, verbose=False,
     )
-    allowed_classes = _select_class_indices(_model_class_names, TARGET_CLASS_NAME)
+    allowed_classes = _select_class_indices(_model_class_names, ACTIVE_CLASS_FILTER)
 
     candidates = []
     for r in results:
@@ -371,7 +484,8 @@ def detect_marker_in_image(image_bgr: np.ndarray, confidence_threshold: float) -
     if not YOLO_AVAILABLE:
         return DetectMarkerResponse(
             found=False, num_candidates=0,
-            message=f"Model chua san sang (mock mode). Dat file .pt vao: {WEIGHTS_PATH}",
+            message="Model chua san sang (mock mode). Goi POST /api/select-model hoac dat "
+                     f"weights_path trong {CONFIG_FILE} roi khoi dong lai.",
         )
 
     candidates = _run_yolo(image_bgr, confidence_threshold)
@@ -403,13 +517,15 @@ async def root():
         "service": "Fiducial Detector Service",
         "status": "running",
         "yolo_available": YOLO_AVAILABLE,
-        "weights_path": WEIGHTS_PATH,
+        "active_weights_path": ACTIVE_WEIGHTS_PATH,
+        "active_class_filter": ACTIVE_CLASS_FILTER,
+        "active_imgsz": ACTIVE_IMGSZ,
         "class_names": _model_class_names,
-        "target_class_filter": TARGET_CLASS_NAME,
-        "imgsz": IMGSZ,
+        "cached_models": list(_model_cache.keys()),
         "save_images": SAVE_IMAGES,
         "saved_images_dir": str(SAVED_IMAGES_DIR),
         "config_path": str(CONFIG_FILE),
+        "active_model_state_path": str(ACTIVE_MODEL_STATE_FILE),
     }
 
 
@@ -423,12 +539,32 @@ async def detect_marker(request: DetectMarkerRequest):
     return result
 
 
+@app.post("/api/select-model", response_model=SelectModelResponse)
+async def select_model(request: SelectModelRequest):
+    """Doi model YOLO dang hoat dong - goi khi operator chon ma hang khac tren app.
+
+    AN TOAN: neu nap that bai (thieu file, model loi...), model dang active HIEN TAI van
+    duoc GIU NGUYEN, khong bi rot ve mock mode chi vi 1 lan chon nham ma hang co cau hinh sai.
+    """
+    try:
+        await asyncio.to_thread(_activate_model, request.weights_path, request.class_name_filter, request.imgsz)
+    except Exception as e:
+        logger.error(f"Doi model that bai (giu nguyen model dang active '{ACTIVE_WEIGHTS_PATH}'): {e}")
+        return SelectModelResponse(success=False, weights_path=ACTIVE_WEIGHTS_PATH, message=str(e))
+
+    _save_active_model_state()
+    logger.info(f"Da doi sang model: {ACTIVE_WEIGHTS_PATH} (classes={_model_class_names})")
+    return SelectModelResponse(
+        success=True, weights_path=ACTIVE_WEIGHTS_PATH, class_names=_model_class_names, message="OK",
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
 
     print("=" * 60)
     print("Starting Fiducial Detector Service")
-    print(f"Weights: {WEIGHTS_PATH} (available={YOLO_AVAILABLE})")
+    print(f"Weights: {ACTIVE_WEIGHTS_PATH} (available={YOLO_AVAILABLE})")
     print(f"URL: http://localhost:{SERVICE_PORT}")
     print(f"Docs: http://localhost:{SERVICE_PORT}/docs")
     print("=" * 60)
