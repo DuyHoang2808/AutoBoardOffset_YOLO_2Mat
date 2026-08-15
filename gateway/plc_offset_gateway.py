@@ -111,9 +111,6 @@ RUNTIME_DIR = get_runtime_dir()
 CONFIG_FILE = RUNTIME_DIR / "plc_offset_gateway_config.json"
 # Mai nhớ sauwr chỗ này
 
-DEFAULT_VRS_CALIB_JSON_PATH = str(RUNTIME_DIR / "vrs_calib_4diem.json")
-DEFAULT_OFFSET_RUNTIME_JSON_PATH = str(RUNTIME_DIR / "offset_runtime.json")
-
 
 # ===============================
 # Persistent gateway config
@@ -179,16 +176,9 @@ class GatewayConfigModel(BaseModel):
     max_allowed_pixel_offset_px: float = 150.0
     max_allowed_rms_error_mm: float = 1.0
 
-    # --- MỚI: đường dẫn file dữ liệu calib (mặc định nằm cùng thư mục gateway) ---
-    vrs_calib_json_path: str = Field(default_factory=lambda: DEFAULT_VRS_CALIB_JSON_PATH)
-    offset_runtime_json_path: str = Field(default_factory=lambda: DEFAULT_OFFSET_RUNTIME_JSON_PATH)
-
-    # --- PA2: calib riêng từng mặt (thay thế cơ chế lật gương cũ) ---
-    # Mỗi mặt board (A/B) có file calib tĩnh riêng + file offset runtime riêng.
-    # Nếu calib_paths không khai báo mặt A → fallback về vrs_calib_json_path (tương thích ngược).
-    # Nếu calib_paths không khai báo mặt B → validate_board_side sẽ trả lỗi 400 rõ ràng.
-    calib_paths: Dict[str, str] = Field(default_factory=dict)   # {"A": "path", "B": "path"}
-    offset_paths: Dict[str, str] = Field(default_factory=dict)  # {"A": "path", "B": "path"}
+    # Đường dẫn file calib/offset tĩnh theo mặt board (A/B) KHÔNG còn khai báo ở đây nữa -
+    # xem gateway/products_registry.yaml (calib_dir theo mã hàng đang active). Đã xoá field
+    # vrs_calib_json_path/offset_runtime_json_path/calib_paths/offset_paths (PA2 cũ).
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -288,8 +278,8 @@ ACTIVE_PRODUCT_CODE: Optional[str] = None
 
 
 def get_active_product() -> Optional[Dict[str, Any]]:
-    """Config (dict) của mã hàng đang active, hoặc None nếu chưa từng chọn mã hàng nào
-    (hệ thống chạy theo kiểu CŨ - dùng calib_paths/vrs_calib_json_path chung như trước)."""
+    """Config (dict) của mã hàng đang active, hoặc None nếu products_registry.yaml rỗng/lỗi
+    (chưa từng khởi tạo được mã hàng nào - resolve_calib_path/resolve_offset_path sẽ raise)."""
     if not ACTIVE_PRODUCT_CODE:
         return None
     return PRODUCTS_REGISTRY.get("products", {}).get(ACTIVE_PRODUCT_CODE)
@@ -1252,14 +1242,7 @@ async def lifespan(_: FastAPI):
     logger.info(f"💾 Config file: {CONFIG_FILE}")
     logger.info(f"📷 Snapshot URL default: {GATEWAY_CONFIG['camera_snapshot_url']}")
     logger.info(f"🎯 Fiducial Detector URL: {GATEWAY_CONFIG['fiducial_api_url']}")
-    logger.info(f"📐 vrs_calib_json_path (fallback A): {GATEWAY_CONFIG['vrs_calib_json_path']}")
-    logger.info(f"📐 offset_runtime_json_path (fallback A): {GATEWAY_CONFIG['offset_runtime_json_path']}")
-    calib_map = GATEWAY_CONFIG.get("calib_paths") or {}
-    offset_map = GATEWAY_CONFIG.get("offset_paths") or {}
-    if calib_map:
-        logger.info(f"📐 PA2 calib_paths: {calib_map}")
-    if offset_map:
-        logger.info(f"📐 PA2 offset_paths: {offset_map}")
+    logger.info(f"📦 Mã hàng đang active: {ACTIVE_PRODUCT_CODE} (xem {PRODUCTS_REGISTRY_FILE})")
     logger.info(
         f"📐 camera_axis_matrix calibrated: {GATEWAY_CONFIG['camera_axis_calibrated']} "
         f"(False = đang dùng ước lượng thô từ FOV, hãy chạy /api/calib/camera-axis)"
@@ -1288,55 +1271,35 @@ def _get_anchor_names(anchor_mode: int) -> List[str]:
     return ANCHOR_SETS[anchor_mode]
 
 
-def resolve_calib_path(board_side: str) -> str:
-    """Trả đường dẫn file calib tĩnh cho mặt board đã cho.
-
-    MỚI: nếu có mã hàng đang active (products_registry.yaml) → dùng calib_dir của mã hàng
-    đó (mỗi mã hàng 1 bộ file riêng, không đụng nhau khi đổi mã hàng).
-    Nếu chưa từng chọn mã hàng nào (hệ thống CŨ, 1 mã hàng duy nhất) → giữ nguyên logic cũ:
-    calib_paths[side] → (nếu side=="A") fallback vrs_calib_json_path.
-    """
-    side = (board_side or "A").upper()
-
+def _require_active_product() -> Dict[str, Any]:
+    """Trả config (dict) của mã hàng đang active, hoặc raise HTTPException 400 rõ ràng nếu
+    chưa có mã hàng nào được chọn (products_registry.yaml rỗng hoặc chưa khởi tạo)."""
     product = get_active_product()
-    if product is not None:
-        return str(Path(product["calib_dir"]) / f"vrs_calib_side_{side.lower()}.json")
+    if product is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Chưa có mã hàng nào đang active. Gọi POST /api/products/select "
+                f"{{'product_code': '<mã hàng>'}} trước (xem {PRODUCTS_REGISTRY_FILE})."
+            ),
+        )
+    return product
 
-    calib_map: Dict[str, str] = GATEWAY_CONFIG.get("calib_paths") or {}
-    if side in calib_map and calib_map[side]:
-        return calib_map[side]
-    if side == "A":
-        return GATEWAY_CONFIG["vrs_calib_json_path"]
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"Chưa khai báo đường dẫn calib cho mặt {side}. Hãy thêm calib_paths.{side} "
-            "vào config (PUT /api/camera-config hoặc file plc_offset_gateway_config.json) "
-            "trỏ tới file vrs_calib_side_b.json đã sinh từ quy trình calib tĩnh."
-        ),
-    )
+
+def resolve_calib_path(board_side: str) -> str:
+    """Trả đường dẫn file calib tĩnh cho mặt board đã cho, theo calib_dir của mã hàng
+    đang active (products_registry.yaml) - mỗi mã hàng 1 bộ file riêng."""
+    side = (board_side or "A").upper()
+    product = _require_active_product()
+    return str(Path(product["calib_dir"]) / f"vrs_calib_side_{side.lower()}.json")
 
 
 def resolve_offset_path(board_side: str) -> str:
-    """Trả đường dẫn file offset runtime cho mặt board đã cho.
-
-    MỚI: nếu có mã hàng đang active → dùng calib_dir của mã hàng đó (xem resolve_calib_path).
-    Nếu chưa từng chọn mã hàng nào → giữ nguyên logic cũ: offset_paths[side] → (side=="A")
-    fallback offset_runtime_json_path → tên mặc định trong RUNTIME_DIR.
-    """
+    """Trả đường dẫn file offset runtime cho mặt board đã cho, theo calib_dir của mã hàng
+    đang active (xem resolve_calib_path)."""
     side = (board_side or "A").upper()
-
-    product = get_active_product()
-    if product is not None:
-        return str(Path(product["calib_dir"]) / f"offset_runtime_side_{side.lower()}.json")
-
-    offset_map: Dict[str, str] = GATEWAY_CONFIG.get("offset_paths") or {}
-    if side in offset_map and offset_map[side]:
-        return offset_map[side]
-    if side == "A":
-        return GATEWAY_CONFIG["offset_runtime_json_path"]
-    # Mặt B chưa khai báo offset_paths → dùng tên mặc định
-    return str(RUNTIME_DIR / f"offset_runtime_side_{side.lower()}.json")
+    product = _require_active_product()
+    return str(Path(product["calib_dir"]) / f"offset_runtime_side_{side.lower()}.json")
 
 
 def validate_board_side(board_side: str) -> None:
@@ -1478,10 +1441,6 @@ async def root():
         "camera_snapshot_url": GATEWAY_CONFIG["camera_snapshot_url"],
         "fiducial_api_url": GATEWAY_CONFIG["fiducial_api_url"],
         "camera_axis_calibrated": GATEWAY_CONFIG["camera_axis_calibrated"],
-        "vrs_calib_json_path": GATEWAY_CONFIG["vrs_calib_json_path"],
-        "offset_runtime_json_path": GATEWAY_CONFIG["offset_runtime_json_path"],
-        "calib_paths": GATEWAY_CONFIG.get("calib_paths") or {},
-        "offset_paths": GATEWAY_CONFIG.get("offset_paths") or {},
         "config_file": str(CONFIG_FILE),
         "active_product": ACTIVE_PRODUCT_CODE,
         "products_registry_file": str(PRODUCTS_REGISTRY_FILE),

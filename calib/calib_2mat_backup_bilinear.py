@@ -9,11 +9,12 @@ calib_2mat.py — Sinh ma trận calib tĩnh cho board 2 mặt (A/B) từ 1 file
 - PLC X/Y đo được trên máy thật, riêng cho từng mặt.
 - Cột PLC mặt nào để trống → bỏ qua mặt đó (chỉ sinh JSON cho mặt có dữ liệu).
 
-Output:
-    gateway/vrs_calib_side_a.json   (nếu có dữ liệu mặt A)
-    gateway/vrs_calib_side_b.json   (nếu có dữ liệu mặt B)
+Output (mặc định - xem gateway/products_registry.yaml, calib_dir của mã hàng đang production):
+    gateway/products/<mã_hàng>/vrs_calib_side_a.json   (nếu có dữ liệu mặt A)
+    gateway/products/<mã_hàng>/vrs_calib_side_b.json   (nếu có dữ liệu mặt B)
 
-Đồng thời cập nhật calib_paths trong gateway/plc_offset_gateway_config.json nếu file tồn tại.
+KHÔNG cần cập nhật gì thêm trong plc_offset_gateway_config.json - gateway tự đọc file này
+theo đúng tên/thư mục quy ước (calib_dir của mã hàng đang active), miễn ghi đúng --output-dir.
 
 Cách dùng:
     cd AutoBoardOffset_YOLO_2Mat/calib
@@ -176,20 +177,6 @@ def read_excel_2mat(excel_path: str) -> tuple[list, list]:
 # Cập nhật gateway config
 # ==============================================================================
 
-def update_gateway_config(config_path: str, side: str, calib_json_path: str):
-    """Thêm/cập nhật calib_paths[side] trong config gateway."""
-    if not os.path.exists(config_path):
-        return
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    if "calib_paths" not in cfg or not isinstance(cfg["calib_paths"], dict):
-        cfg["calib_paths"] = {}
-    cfg["calib_paths"][side] = calib_json_path
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print(f"  -> Đã cập nhật calib_paths.{side} trong {config_path}")
-
-
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -201,9 +188,7 @@ def main():
     parser.add_argument("--excel", default=None,
                         help="Đường dẫn file Excel (mặc định: calib_2mat.xlsx cùng thư mục)")
     parser.add_argument("--output-dir", default=None,
-                        help="Thư mục xuất JSON (mặc định: ../gateway/)")
-    parser.add_argument("--no-update-config", action="store_true",
-                        help="Không tự động cập nhật plc_offset_gateway_config.json")
+                        help="Thư mục xuất JSON (mặc định: calib_dir của mã hàng đang production)")
     args = parser.parse_args()
 
     this_dir = Path(__file__).resolve().parent
@@ -217,7 +202,6 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else (
         project_dir / "gateway" / "products" / "23691025-250616-0004-nvq-aoi"
     )
-    config_path = project_dir / "gateway" / "plc_offset_gateway_config.json"
 
     if not os.path.exists(excel_path):
         print(f"LỖI: Không tìm thấy file Excel: {excel_path}")
@@ -241,8 +225,6 @@ def main():
                 json.dump(result, f, indent=4, ensure_ascii=False)
             print(f"  -> Đã lưu: {out_path}")
             generated.append(("A", out_path))
-            if not args.no_update_config:
-                update_gateway_config(str(config_path), "A", out_path)
         print()
     else:
         print("Mặt A: không có dữ liệu PLC → bỏ qua.\n")
@@ -258,8 +240,6 @@ def main():
                 json.dump(result, f, indent=4, ensure_ascii=False)
             print(f"  -> Đã lưu: {out_path}")
             generated.append(("B", out_path))
-            if not args.no_update_config:
-                update_gateway_config(str(config_path), "B", out_path)
         print()
     else:
         print("Mặt B: không có dữ liệu PLC → bỏ qua.\n")
@@ -270,8 +250,6 @@ def main():
         print("HOÀN TẤT! Đã sinh file calib:")
         for side, path in generated:
             print(f"  Mặt {side}: {path}")
-        if not args.no_update_config and os.path.exists(config_path):
-            print(f"\nConfig gateway đã được cập nhật: {config_path}")
         print("=" * 60)
     else:
         print("Không sinh được file nào. Kiểm tra lại dữ liệu trong Excel.")
