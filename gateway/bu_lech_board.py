@@ -144,7 +144,10 @@ def apply_rigid_offset(x_plc, y_plc, R, t):
 
 def run():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    json_path = os.path.join(BASE_DIR, "vrs_calib_side_b.json")
+    # File cua ma hang dang production (xem gateway/products_registry.yaml), khong con
+    # nam thang trong gateway/ nua.
+    PRODUCT_DIR = os.path.join(BASE_DIR, "products", "23691025-250616-0004-nvq-aoi")
+    json_path = os.path.join(PRODUCT_DIR, "vrs_calib_side_b.json")
     coeffs = load_calibration_matrix(json_path)
 
     anchor_mode = choose_anchor_mode()
@@ -209,7 +212,7 @@ def run():
         "anchor_points_measured_plc": measured_points,
         "residuals_mm": residuals.tolist(),
     }
-    offset_path = os.path.join(BASE_DIR, "offset_runtime_side_b.json")
+    offset_path = os.path.join(PRODUCT_DIR, "offset_runtime_side_b.json")
     with open(offset_path, "w", encoding="utf-8") as f:
         json.dump(offset_data, f, indent=4, ensure_ascii=False)
     print(f"\nĐã lưu hệ số bù vào: {offset_path}\n")

@@ -318,7 +318,13 @@ def main():
     project_dir = this_dir.parent
 
     excel_path = args.excel or str(this_dir / "calib_2mat.xlsx")
-    output_dir = Path(args.output_dir) if args.output_dir else (project_dir / "gateway")
+    # Mac dinh ghi vao thu muc rieng cua ma hang dang production (xem
+    # gateway/products_registry.yaml) - khong con ghi thang vao gateway/ nua, vi
+    # resolve_calib_path() giờ uu tien calib_dir cua ma hang dang active. Dung
+    # --output-dir de ghi cho 1 ma hang khac.
+    output_dir = Path(args.output_dir) if args.output_dir else (
+        project_dir / "gateway" / "products" / "23691025-250616-0004-nvq-aoi"
+    )
     config_path = project_dir / "gateway" / "plc_offset_gateway_config.json"
 
     if not os.path.exists(excel_path):

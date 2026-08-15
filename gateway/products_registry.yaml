@@ -21,11 +21,10 @@
 default_product: "23691025-250616-0004-nvq-aoi"
 
 products:
-  # Ma hang dang chay production hien tai. calib_dir = chinh thu muc gateway/ nay, vi
-  # vrs_calib_side_a/b.json + offset_runtime_side_a/b.json dang dung THAT da nam san o day
-  # - khong can di chuyen file nao khi bat tinh nang nhieu ma hang.
+  # Ma hang dang chay production hien tai. vrs_calib_side_a/b.json + offset_runtime_side_a/b.json
+  # da duoc gom rieng vao thu muc products/<ma_hang>/ nay (truoc do nam chung trong gateway/).
   "23691025-250616-0004-nvq-aoi":
     weights_path: D:\Camera\Weight\VRS_yolo11n_640x640\weights\best.pt
     class_name_filter: 0
     imgsz: 640
-    calib_dir: D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway
+    calib_dir: D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway\products\23691025-250616-0004-nvq-aoi

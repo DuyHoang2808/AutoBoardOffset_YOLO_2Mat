@@ -39,7 +39,8 @@ if __name__ == "__main__":
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
     # json_path = os.path.join(BASE_DIR, "vrs_calib_4diem.json")
-    json_path = r"D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway\vrs_calib_side_b.json"
+    # Da doi sang thu muc rieng cua ma hang dang production (xem gateway/products_registry.yaml)
+    json_path = r"D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway\products\23691025-250616-0004-nvq-aoi\vrs_calib_side_b.json"
 
     # 1. Load các hệ số calib từ file JSON lên bộ nhớ
     try:

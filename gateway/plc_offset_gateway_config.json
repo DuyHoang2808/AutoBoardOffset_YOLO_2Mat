@@ -43,11 +43,11 @@
   "vrs_calib_json_path": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\vrs_calib_4diem.json",
   "offset_runtime_json_path": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\offset_runtime.json",
   "calib_paths": {
-    "A": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\vrs_calib_side_a.json",
-    "B": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\vrs_calib_side_b.json"
+    "A": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\products\\23691025-250616-0004-nvq-aoi\\vrs_calib_side_a.json",
+    "B": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\products\\23691025-250616-0004-nvq-aoi\\vrs_calib_side_b.json"
   },
   "offset_paths": {
-    "A": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\offset_runtime_side_a.json",
-    "B": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\offset_runtime_side_b.json"
+    "A": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\products\\23691025-250616-0004-nvq-aoi\\offset_runtime_side_a.json",
+    "B": "D:\\Camera\\Dev\\AutoBoardOffset_YOLO_2Mat\\gateway\\products\\23691025-250616-0004-nvq-aoi\\offset_runtime_side_b.json"
   }
 }
