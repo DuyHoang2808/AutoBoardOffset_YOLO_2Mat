@@ -1487,6 +1487,8 @@ async def select_product(request: ProductSelectRequest):
     """
     global ACTIVE_PRODUCT_CODE
 
+    previous_product_code = ACTIVE_PRODUCT_CODE
+
     product = PRODUCTS_REGISTRY.get("products", {}).get(request.product_code)
     if product is None:
         raise HTTPException(
@@ -1496,6 +1498,9 @@ async def select_product(request: ProductSelectRequest):
                 f"Các mã hàng hiện có: {list(PRODUCTS_REGISTRY.get('products', {}).keys())}"
             ),
         )
+
+    if request.product_code == previous_product_code:
+        logger.info(f"ℹ️ Mã hàng '{request.product_code}' đã đang active sẵn - không cần đổi.")
 
     fiducial_base = resolve_fiducial_service_base_url()
     fiducial_result = await asyncio.to_thread(
@@ -1507,7 +1512,10 @@ async def select_product(request: ProductSelectRequest):
     )
     if fiducial_result is None or not fiducial_result.get("success"):
         message = (fiducial_result or {}).get("message") or f"Không gọi được Fiducial Detector Service tại {fiducial_base}"
-        logger.error(f"❌ Chọn mã hàng '{request.product_code}' thất bại (giữ nguyên mã hàng cũ '{ACTIVE_PRODUCT_CODE}'): {message}")
+        logger.error(
+            f"❌ Đổi mã hàng '{previous_product_code}' → '{request.product_code}' thất bại "
+            f"(giữ nguyên mã hàng cũ '{previous_product_code}'): {message}"
+        )
         return ProductSelectResponse(success=False, product_code=request.product_code, message=message)
 
     ACTIVE_PRODUCT_CODE = request.product_code
@@ -1515,7 +1523,10 @@ async def select_product(request: ProductSelectRequest):
     calib_dir = Path(product["calib_dir"])
     calib_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"✅ Đã chọn mã hàng: {request.product_code} (weights={product['weights_path']}, calib_dir={calib_dir})")
+    logger.info(
+        f"🔄 Đã đổi mã hàng: '{previous_product_code}' → '{request.product_code}' "
+        f"(weights={product['weights_path']}, calib_dir={calib_dir})"
+    )
     return ProductSelectResponse(
         success=True, product_code=request.product_code, message="OK",
         weights_path=product["weights_path"], calib_dir=str(calib_dir),

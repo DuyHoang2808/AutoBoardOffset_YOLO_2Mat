@@ -546,14 +546,25 @@ async def select_model(request: SelectModelRequest):
     AN TOAN: neu nap that bai (thieu file, model loi...), model dang active HIEN TAI van
     duoc GIU NGUYEN, khong bi rot ve mock mode chi vi 1 lan chon nham ma hang co cau hinh sai.
     """
+    previous_weights_path = ACTIVE_WEIGHTS_PATH
+    requested_key = str(Path(request.weights_path).resolve())
+
+    if requested_key == previous_weights_path:
+        logger.info(f"Model '{previous_weights_path}' da dang active san - khong can doi.")
+
     try:
         await asyncio.to_thread(_activate_model, request.weights_path, request.class_name_filter, request.imgsz)
     except Exception as e:
-        logger.error(f"Doi model that bai (giu nguyen model dang active '{ACTIVE_WEIGHTS_PATH}'): {e}")
+        logger.error(
+            f"Doi model '{previous_weights_path}' -> '{request.weights_path}' that bai "
+            f"(giu nguyen model dang active '{previous_weights_path}'): {e}"
+        )
         return SelectModelResponse(success=False, weights_path=ACTIVE_WEIGHTS_PATH, message=str(e))
 
     _save_active_model_state()
-    logger.info(f"Da doi sang model: {ACTIVE_WEIGHTS_PATH} (classes={_model_class_names})")
+    logger.info(
+        f"Da doi model: '{previous_weights_path}' -> '{ACTIVE_WEIGHTS_PATH}' (classes={_model_class_names})"
+    )
     return SelectModelResponse(
         success=True, weights_path=ACTIVE_WEIGHTS_PATH, class_names=_model_class_names, message="OK",
     )
