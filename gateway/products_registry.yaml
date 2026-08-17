@@ -28,3 +28,9 @@ products:
     class_name_filter: 0
     imgsz: 640
     calib_dir: D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway\products\23691025-250616-0004-nvq-aoi
+  # Ma hang moi - da co san file calib/offset trong thu muc rieng.
+  "aoi-23692109-250613-dht":
+    weights_path: D:\Camera\Weight\VRS_yolo11n_640x640\weights\best.pt
+    class_name_filter: 0
+    imgsz: 640
+    calib_dir: D:\Camera\Dev\AutoBoardOffset_YOLO_2Mat\gateway\products\aoi-23692109-250613-dht
